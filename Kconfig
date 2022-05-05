@@ -1,0 +1,7 @@
+config SAND
+	tristate "Simple sandbox based on Intel VTX"
+	depends on X86 && 64BIT
+	default y
+	help
+	  A simple kernel driver implementing sandbox using
+	  Intel virtualization extensions.
