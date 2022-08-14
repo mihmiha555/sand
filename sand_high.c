@@ -91,12 +91,17 @@ static struct sand_dev dev = {
 };
 
 extern int _sand_cpu_vmxon(uint64_t *addr);
+extern void _sand_cpu_vmxoff(void);
 extern int _sand_cpu_vmcs_clear(uint64_t *addr);
 extern int _sand_cpu_vmcs_load(uint64_t *addr);
 
 static int sand_cpu_vmxon(uint64_t addr)
 {
 	return _sand_cpu_vmxon(&addr);
+}
+static void sand_cpu_vmxoff(void)
+{
+	_sand_cpu_vmxoff();
 }
 static int sand_cpu_vmcs_clear(uint64_t addr)
 {
@@ -284,6 +289,8 @@ static void set_vmxe_cr4_pcpu(void *unused)
 		&per_cpu(cpu, smp_processor_id());
 
 	uint64_t vmx_basic;
+	uint64_t vmx_fixed0, vmx_fixed1;
+	uint64_t vmx_cr0, vmx_cr4;
 
 	state->vmxon_region = (void *) get_zeroed_page(GFP_KERNEL);
 	if (!state->vmxon_region)
@@ -296,8 +303,17 @@ static void set_vmxe_cr4_pcpu(void *unused)
 
 	*((uint32_t *)state->vmxon_region) = (uint32_t)vmx_basic;
 
-	write_cr0(state->cr0 | X86_CR0_NE);
-	__write_cr4(state->cr4 | X86_CR4_VMXE);
+	rdmsrl_safe(MSR_IA32_VMX_CR0_FIXED0, &vmx_fixed0);
+	rdmsrl_safe(MSR_IA32_VMX_CR0_FIXED1, &vmx_fixed1);
+
+	vmx_cr0 = (state->cr0 | vmx_fixed0) & vmx_fixed1;
+	write_cr0(vmx_cr0);
+
+	rdmsrl_safe(MSR_IA32_VMX_CR4_FIXED0, &vmx_fixed0);
+	rdmsrl_safe(MSR_IA32_VMX_CR4_FIXED1, &vmx_fixed1);
+
+	vmx_cr4 = (state->cr4 | vmx_fixed0) & vmx_fixed1;
+	__write_cr4(vmx_cr4);
 
 	if (sand_cpu_vmxon(virt_to_phys(state->vmxon_region))) {
 		pr_err("Failed to call VMXON\n");
@@ -316,21 +332,40 @@ static void enable_vmx(void)
 	on_each_cpu(set_vmxe_cr4_pcpu, NULL, 1);
 }
 
-static void restore_cr4_pcpu(void *unused)
+static void restore_cr0_cr4_pcpu(void *unused)
 {
 	struct cpu_state *state =
 		&per_cpu(cpu, smp_processor_id());
 
-	if (state->enabled)
-		free_page((unsigned long)state->vmxon_region);
-
-	if (state->saved)
+	if (state->saved) {
+		write_cr0(state->cr0);
 		__write_cr4(state->cr4);
+
+		state->saved = 0;
+	}
 }
 
 static void restore_cpu_state(void)
 {
-	on_each_cpu(restore_cr4_pcpu, NULL, 1);
+	on_each_cpu(restore_cr0_cr4_pcpu, NULL, 1);
+}
+
+static void exec_vmxoff_pcpu(void *unused)
+{
+	struct cpu_state *state =
+		&per_cpu(cpu, smp_processor_id());
+
+	if(state->enabled) {
+		sand_cpu_vmxoff();
+		free_page((unsigned long)state->vmxon_region);
+
+		state->enabled = 0;
+	}
+}
+
+static void disable_vmx(void)
+{
+	on_each_cpu(exec_vmxoff_pcpu, NULL, 1);
 }
 
 static void init_guest_state(void)
@@ -632,25 +667,25 @@ static int sand_open(struct inode *inode, struct file *file)
 		goto out_free_ctx;
 	}
 
-	ctx->code = (void *)get_zeroed_page(GFP_KERNEL);
+	ctx->code = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
 	if (!ctx->code) {
 		pr_err("Failed to alloc code page\n");
 		goto out_free_vmcs;
 	}
 
-	ctx->stack = (void *)get_zeroed_page(GFP_KERNEL);
+	ctx->stack = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
 	if (!ctx->stack) {
 		pr_err("Failed to alloc stack page\n");
 		goto out_free_code;
 	}
 
-	ctx->page_dir = (void *)get_zeroed_page(GFP_KERNEL);
+	ctx->page_dir = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
 	if (!ctx->page_dir) {
 		pr_err("Failed to alloc page for page directory\n");
 		goto out_free_stack;
 	}
 
-	ctx->page_table = (void *)get_zeroed_page(GFP_KERNEL);
+	ctx->page_table = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
 	if (!ctx->page_table) {
 		pr_err("Failed to alloc page for page table\n");
 		goto out_free_page_dir;
@@ -840,7 +875,17 @@ out:
 
 static void __exit sand_exit(void)
 {
+	disable_vmx();
+
+	pr_info("Disabled virtualization extensions\n");
+
 	restore_cpu_state();
+
+	pr_info("Restored original host state (CR0, CR4)\n");
+
+	misc_deregister(&dev.misc);
+
+	pr_info("Deregistered misc device\n");
 }
 
 module_init(sand_init);

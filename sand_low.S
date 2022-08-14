@@ -2,6 +2,7 @@
 #include <asm/unwind_hints.h>
 
 .global _sand_cpu_vmxon
+.global _sand_cpu_vmxoff
 .global _sand_cpu_vmcs_clear
 .global _sand_cpu_vmcs_load
 .global sand_cpu_vmcs_write_64
@@ -46,6 +47,11 @@ SYM_FUNC_START(_sand_cpu_vmxon)
 	setna %al
 	ret
 SYM_FUNC_END(_sand_cpu_vmxon)
+
+SYM_FUNC_START(_sand_cpu_vmxoff)
+	vmxoff
+	ret
+SYM_FUNC_END(_sand_cpu_vmxoff)
 
 SYM_FUNC_START(_sand_cpu_vmcs_clear)
 	xor %rax, %rax
