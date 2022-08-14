@@ -1,0 +1,12 @@
+*.bin
+.*.cmd
+*.ko
+*.mod
+*.mod.c
+*.o
+*.o.*
+built-in.a
+modules.builtin
+modules.order
+Module.symvers
+sandctl
