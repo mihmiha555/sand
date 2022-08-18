@@ -16,6 +16,8 @@
 
 #define VMX_BASIC_USE_TRUE_CTRLS (1ull << 55)
 
+#define VM_TIMEOUT_MS 5000
+
 struct cpu_state {
 	uint64_t cr0;
 	uint64_t cr4;
@@ -368,6 +370,20 @@ static void disable_vmx(void)
 	on_each_cpu(exec_vmxoff_pcpu, NULL, 1);
 }
 
+static uint32_t millisecs_to_preempt_timer_value(uint32_t millisecs)
+{
+	const uint64_t tsc_rate = tsc_khz * 1000;
+	uint64_t misc = 0;
+	uint64_t preemption_timer_rate = 0;
+	uint32_t preemption_timer_value = 0;
+
+	rdmsrl_safe(MSR_IA32_VMX_MISC, &misc);
+	preemption_timer_rate = tsc_rate >> vmx_misc_preemption_timer_rate(misc);
+	preemption_timer_value = preemption_timer_rate * millisecs / 1000;
+
+	return preemption_timer_value;
+}
+
 static void init_guest_state(void)
 {
 	const uint8_t uc = 0, wt = 4, wb = 6, ucm = 7;
@@ -391,7 +407,9 @@ static void init_guest_state(void)
 			wb, wt, ucm, uc, wb, wt, ucm, uc
 		}
 	};
+	const uint32_t timer_value = millisecs_to_preempt_timer_value(VM_TIMEOUT_MS);
 
+	sand_cpu_vmcs_write_32(VMX_PREEMPTION_TIMER_VALUE, timer_value);
 	sand_cpu_vmcs_write_32(VIRTUAL_PROCESSOR_ID, 0);
 	sand_cpu_vmcs_write_64(VMCS_LINK_POINTER, -1ull);
 
@@ -558,12 +576,14 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 	pin_based_controls = 0
 		| PIN_BASED_EXT_INTR_MASK
 		| PIN_BASED_NMI_EXITING
+		| PIN_BASED_VMX_PREEMPTION_TIMER
 		;
 
 	vmentry_controls = 0;
 
 	vmexit_controls = 0
 		| VM_EXIT_HOST_ADDR_SPACE_SIZE
+		| VM_EXIT_SAVE_VMX_PREEMPTION_TIMER
 		;
 
 	rdmsrl_safe(MSR_IA32_VMX_BASIC, &vmx_basic);
@@ -809,8 +829,11 @@ static long sand_ioctl(struct file *file, unsigned int cmd,
 
 			first = 0;
 
-			/* We return to user space on HLT VMEXIT. */
-			if (12 == vmexit)
+			/* We return to user space on HLT VMEXIT
+			 * or when VMX-preemption timer expires.
+			 */
+			if (vmexit == EXIT_REASON_HLT ||
+				vmexit == EXIT_REASON_PREEMPTION_TIMER)
 				stop = 1;
 		}
 	} while (!stop);
