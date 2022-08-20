@@ -61,6 +61,7 @@ struct sand_guest_ctx {
 struct sand_ctx {
 	void *vmcs;
 	void *code;
+	void *data;
 	void *stack;
 	void *page_dir;
 	void *page_table;
@@ -431,12 +432,15 @@ static void set_initial_guest_ctx(struct sand_ctx *ctx)
 	BUG_ON((unsigned long)virt_to_phys(ctx->page_table) >= 0x100000000);
 	BUG_ON((unsigned long)virt_to_phys(ctx->stack) >= 0x100000000);
 	BUG_ON((unsigned long)virt_to_phys(ctx->code) >= 0x100000000);
+	BUG_ON((unsigned long)virt_to_phys(ctx->data) >= 0x100000000);
 
 	((uint32_t *)ctx->page_dir)[0] = (uint32_t)virt_to_phys(ctx->page_table) | 1;
 	/* Present. */
 	((uint32_t *)ctx->page_table)[0] = (uint32_t)virt_to_phys(ctx->stack) | 3;
 	/* Present, read only. */
 	((uint32_t *)ctx->page_table)[1] = (uint32_t)virt_to_phys(ctx->code) | 1;
+	/* Present, read/write. */
+	((uint32_t *)ctx->page_table)[2] = (uint32_t)virt_to_phys(ctx->data) | 3;
 
 	sand_cpu_vmcs_write(GUEST_RSP, 4096);
 	sand_cpu_vmcs_write(GUEST_RIP, 4096);
@@ -693,10 +697,16 @@ static int sand_open(struct inode *inode, struct file *file)
 		goto out_free_vmcs;
 	}
 
+	ctx->data = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
+	if (!ctx->data) {
+		pr_err("Failed to alloc data page\n");
+		goto out_free_code;
+	}
+
 	ctx->stack = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
 	if (!ctx->stack) {
 		pr_err("Failed to alloc stack page\n");
-		goto out_free_code;
+		goto out_free_data;
 	}
 
 	ctx->page_dir = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
@@ -719,6 +729,8 @@ out_free_page_dir:
 	free_page((unsigned long)ctx->page_dir);
 out_free_stack:
 	free_page((unsigned long)ctx->stack);
+out_free_data:
+	free_page((unsigned long)ctx->data);
 out_free_code:
 	free_page((unsigned long)ctx->code);
 out_free_vmcs:
@@ -738,6 +750,8 @@ static int sand_release(struct inode *inode, struct file *file)
 			free_page((unsigned long)ctx->vmcs);
 		if (ctx->code)
 			free_page((unsigned long)ctx->code);
+		if (ctx->data)
+			free_page((unsigned long)ctx->data);
 		if (ctx->stack)
 			free_page((unsigned long)ctx->stack);
 		if (ctx->page_dir)
