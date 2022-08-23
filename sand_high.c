@@ -7,6 +7,7 @@
 #include <linux/ioctl.h>
 #include <linux/slab.h>
 #include <linux/fs.h>
+#include <linux/random.h>
 #include <asm/vmx.h>
 
 #include "sand.h"
@@ -17,6 +18,14 @@
 #define VMX_BASIC_USE_TRUE_CTRLS (1ull << 55)
 
 #define VM_TIMEOUT_MS 5000
+
+enum sand_hypercalls {
+	SAND_HC_GET_PRANDOM_VALUE = 1
+};
+
+enum sand_hypercall_errors {
+	SAND_UNKNOWN_HYPERCALL = 1000
+};
 
 struct cpu_state {
 	uint64_t cr0;
@@ -765,6 +774,39 @@ static int sand_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static void skip_vmexit_instruction(void)
+{
+	uint64_t guest_rip = sand_cpu_vmcs_read(GUEST_RIP);
+	guest_rip += sand_cpu_vmcs_read_32(VM_EXIT_INSTRUCTION_LEN);
+	sand_cpu_vmcs_write(GUEST_RIP, guest_rip);
+}
+
+static void handle_hypercall(struct sand_ctx *ctx)
+{
+	uint64_t nr, ret;
+	uint64_t arg[4];
+
+	nr = ctx->guest_ctx.rax;
+	arg[0] = ctx->guest_ctx.rbx;
+	arg[1] = ctx->guest_ctx.rcx;
+	arg[2] = ctx->guest_ctx.rdx;
+	arg[3] = ctx->guest_ctx.rsi;
+
+	switch (nr) {
+	case SAND_HC_GET_PRANDOM_VALUE:
+		ret = prandom_u32() & 0xFFFF;
+		break;
+	default:
+		pr_warning("Unknown hypercall %llu\n", nr);
+		ret = -SAND_UNKNOWN_HYPERCALL;
+		break;
+	}
+
+	ctx->guest_ctx.rax = (uint32_t)ret;
+
+	skip_vmexit_instruction();
+}
+
 static int run_ctx(struct sand_ctx *ctx, unsigned long first)
 {
 	extern void sand_vm_launch(struct sand_guest_ctx *gctx,
@@ -843,12 +885,18 @@ static long sand_ioctl(struct file *file, unsigned int cmd,
 
 			first = 0;
 
+			switch (vmexit) {
+			case EXIT_REASON_VMCALL:
+				handle_hypercall(ctx);
+				break;
+			case EXIT_REASON_HLT:
+			case EXIT_REASON_PREEMPTION_TIMER:
 			/* We return to user space on HLT VMEXIT
 			 * or when VMX-preemption timer expires.
 			 */
-			if (vmexit == EXIT_REASON_HLT ||
-				vmexit == EXIT_REASON_PREEMPTION_TIMER)
 				stop = 1;
+				break;
+			}
 		}
 	} while (!stop);
 
