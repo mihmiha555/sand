@@ -138,6 +138,10 @@ SYM_FUNC_START(sand_vm_launch)
 	push %r15
 	pushf
 
+	sub $6, %rsp
+	fstcw (%rsp)
+	stmxcsr 2(%rsp)
+
 	cli
 	cmpq $1, %rdx
 
@@ -210,6 +214,10 @@ SYM_FUNC_START(sand_vm_launch)
 	mov shc_host_stack(%rsp), %rsp
 
 3:
+
+	fldcw (%rsp)
+	ldmxcsr 2(%rsp)
+	add $6, %rsp
 
 	popf
 	pop %r15

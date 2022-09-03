@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/random.h>
+#include <asm/fpu/api.h>
 #include <asm/vmx.h>
 
 #include "sand.h"
@@ -455,14 +456,15 @@ static void set_initial_guest_ctx(struct sand_ctx *ctx)
 	sand_cpu_vmcs_write(GUEST_RIP, 4096);
 	sand_cpu_vmcs_write(GUEST_RFLAGS, 0x2);
 
-	sand_cpu_vmcs_write(GUEST_CR0, X86_CR0_PG | X86_CR0_PE | X86_CR0_NE);
+	sand_cpu_vmcs_write(GUEST_CR0, X86_CR0_PG | X86_CR0_PE | X86_CR0_NE
+									| X86_CR0_MP);
 	sand_cpu_vmcs_write(CR0_READ_SHADOW, X86_CR0_PG | X86_CR0_PE | X86_CR0_NE);
-	sand_cpu_vmcs_write(GUEST_CR4, X86_CR4_PSE | X86_CR4_VMXE);
-	sand_cpu_vmcs_write(CR0_READ_SHADOW, X86_CR4_PSE);
+	sand_cpu_vmcs_write(GUEST_CR4, X86_CR4_PSE | X86_CR4_VMXE | X86_CR4_OSFXSR
+									| X86_CR4_OSXMMEXCPT);
+	sand_cpu_vmcs_write(CR4_READ_SHADOW, X86_CR4_PSE);
 	sand_cpu_vmcs_write(GUEST_CR3, virt_to_phys(ctx->page_dir));
 
 	sand_cpu_vmcs_write_64(GUEST_IA32_EFER, 0);
-	sand_cpu_vmcs_write_64(GUEST_IA32_PAT, 0x0007040600070406ull);
 	sand_cpu_vmcs_write(GUEST_SYSENTER_CS, 0);
 	sand_cpu_vmcs_write(GUEST_SYSENTER_ESP, 0);
 	sand_cpu_vmcs_write(GUEST_SYSENTER_EIP, 0);
@@ -853,7 +855,7 @@ static long sand_ioctl(struct file *file, unsigned int cmd,
 
 	pr_info("Going to run %zu bytes of code\n", sandbox.code_size);
 
-	preempt_disable();
+	kernel_fpu_begin();
 
 	if (init_sand_ctx(ctx)) {
 		pr_err("Failed to init sand context\n");
@@ -910,7 +912,7 @@ static long sand_ioctl(struct file *file, unsigned int cmd,
 		goto out_preempt_enable;
 	}
 
-	preempt_enable();
+	kernel_fpu_end();
 
 	non_copied = copy_to_user(sandbox_ptr, &sandbox, sizeof(sandbox));
 	if (non_copied) {
@@ -921,7 +923,7 @@ static long sand_ioctl(struct file *file, unsigned int cmd,
 	return 0;
 
 out_preempt_enable:
-	preempt_enable();
+	kernel_fpu_end();
 out:
 	return -EINVAL;
 }
@@ -976,4 +978,4 @@ static void __exit sand_exit(void)
 module_init(sand_init);
 module_exit(sand_exit);
 
-MODULE_LICENSE("BSD");
+MODULE_LICENSE("Dual BSD/GPL");
