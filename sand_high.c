@@ -28,6 +28,11 @@ enum sand_hypercall_errors {
 	SAND_UNKNOWN_HYPERCALL = 1000
 };
 
+enum invept_type {
+	SINGLE_CONTEXT = 1,
+	ALL_CONTEXT = 2
+};
+
 struct cpu_state {
 	uint64_t cr0;
 	uint64_t cr4;
@@ -76,6 +81,11 @@ struct sand_ctx {
 	void *page_dir;
 	void *page_table;
 
+	void *ept_pml4;
+	void *ept_pdpt;
+	void *ept_pd;
+	void *ept_pt;
+
 	struct sand_host_ctx saved_host_ctx;
 	struct sand_guest_ctx guest_ctx;
 };
@@ -105,6 +115,7 @@ static struct sand_dev dev = {
 
 extern int _sand_cpu_vmxon(uint64_t *addr);
 extern void _sand_cpu_vmxoff(void);
+extern int _sand_cpu_invept(uint64_t type, uint64_t *eptp_descr);
 extern int _sand_cpu_vmcs_clear(uint64_t *addr);
 extern int _sand_cpu_vmcs_load(uint64_t *addr);
 
@@ -115,6 +126,11 @@ static int sand_cpu_vmxon(uint64_t addr)
 static void sand_cpu_vmxoff(void)
 {
 	_sand_cpu_vmxoff();
+}
+static int sand_cpu_invept(enum invept_type type, uint64_t eptp)
+{
+	uint64_t eptp_descr[] = {eptp, 0};
+	return _sand_cpu_invept((uint64_t)type, eptp_descr);
 }
 static int sand_cpu_vmcs_clear(uint64_t addr)
 {
@@ -399,6 +415,8 @@ static void init_guest_state(void)
 {
 	const uint8_t uc = 0, wt = 4, wb = 6, ucm = 7;
 	const unsigned long guest_cr0_bits = 0
+		| X86_CR0_PG
+		| X86_CR0_WP
 		| X86_CR0_MP
 		| X86_CR0_EM
 		| X86_CR0_TS;
@@ -434,35 +452,39 @@ static void init_guest_state(void)
 
 static void set_initial_guest_ctx(struct sand_ctx *ctx)
 {
-	/* We use stack one page in length placed before the code. */
-	/* Remember, stack grows down towards 0. */
-	/* Here I hope that all the pages have addresses lower than 4GB. */
+	/* Setting up EPTP: write-back caching, page-walk length 4. */
+	const uint64_t eptp = virt_to_phys(ctx->ept_pml4) | (3 << 3) | 6;
 
-	BUG_ON((unsigned long)virt_to_phys(ctx->page_dir) >= 0x100000000);
-	BUG_ON((unsigned long)virt_to_phys(ctx->page_table) >= 0x100000000);
-	BUG_ON((unsigned long)virt_to_phys(ctx->stack) >= 0x100000000);
-	BUG_ON((unsigned long)virt_to_phys(ctx->code) >= 0x100000000);
-	BUG_ON((unsigned long)virt_to_phys(ctx->data) >= 0x100000000);
+	/* Read/write/execute access for this 512Gb region. */
+	((uint64_t *)ctx->ept_pml4)[0] = virt_to_phys(ctx->ept_pdpt) | 7;
+	/* Read/write/execute access for this 1Gb region. */
+	((uint64_t *)ctx->ept_pdpt)[0] = virt_to_phys(ctx->ept_pd) | 7;
+	/* Read/write/execute access for this 2Mb region. */
+	((uint64_t *)ctx->ept_pd)[0] = virt_to_phys(ctx->ept_pt) | 7;
 
-	((uint32_t *)ctx->page_dir)[0] = (uint32_t)virt_to_phys(ctx->page_table) | 1;
-	/* Present. */
-	((uint32_t *)ctx->page_table)[0] = (uint32_t)virt_to_phys(ctx->stack) | 3;
-	/* Present, read only. */
-	((uint32_t *)ctx->page_table)[1] = (uint32_t)virt_to_phys(ctx->code) | 1;
-	/* Present, read/write. */
-	((uint32_t *)ctx->page_table)[2] = (uint32_t)virt_to_phys(ctx->data) | 3;
+	/* Read/write access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[0] = virt_to_phys(ctx->stack) | (6 << 3) | 3;
+	/* Read/execute access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[1] = virt_to_phys(ctx->code)  | (6 << 3) | 5;
+	/* Read/write access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[2] = virt_to_phys(ctx->data)  | (6 << 3) | 3;
+	/* Read/write access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[3] = virt_to_phys(ctx->page_table) | (6 << 3) | 3;
+	/* Read/write access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[4] = virt_to_phys(ctx->page_dir)   | (6 << 3) | 3;
+
+	sand_cpu_vmcs_write_64(EPT_POINTER, eptp);
 
 	sand_cpu_vmcs_write(GUEST_RSP, 4096);
 	sand_cpu_vmcs_write(GUEST_RIP, 4096);
 	sand_cpu_vmcs_write(GUEST_RFLAGS, 0x2);
 
-	sand_cpu_vmcs_write(GUEST_CR0, X86_CR0_PG | X86_CR0_PE | X86_CR0_NE
-									| X86_CR0_MP);
-	sand_cpu_vmcs_write(CR0_READ_SHADOW, X86_CR0_PG | X86_CR0_PE | X86_CR0_NE);
+	sand_cpu_vmcs_write(GUEST_CR0, X86_CR0_PE | X86_CR0_NE | X86_CR0_MP);
+	sand_cpu_vmcs_write(CR0_READ_SHADOW, X86_CR0_PE | X86_CR0_NE);
 	sand_cpu_vmcs_write(GUEST_CR4, X86_CR4_PSE | X86_CR4_VMXE | X86_CR4_OSFXSR
 									| X86_CR4_OSXMMEXCPT);
 	sand_cpu_vmcs_write(CR4_READ_SHADOW, X86_CR4_PSE);
-	sand_cpu_vmcs_write(GUEST_CR3, virt_to_phys(ctx->page_dir));
+	sand_cpu_vmcs_write(GUEST_CR3, 0);
 
 	sand_cpu_vmcs_write_64(GUEST_IA32_EFER, 0);
 	sand_cpu_vmcs_write(GUEST_SYSENTER_CS, 0);
@@ -575,7 +597,8 @@ static void save_host_state(void)
 
 static int init_sand_ctx(struct sand_ctx *ctx)
 {
-	uint32_t cpu_based_controls;
+	uint32_t primary_cpu_based_controls;
+	uint32_t secondary_cpu_based_controls;
 	uint32_t pin_based_controls;
 	uint32_t vmentry_controls;
 	uint32_t vmexit_controls;
@@ -584,8 +607,14 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 
 	extern void sand_vm_exit(void);
 
-	cpu_based_controls = 0
+	primary_cpu_based_controls = 0
 		| CPU_BASED_HLT_EXITING
+		| CPU_BASED_ACTIVATE_SECONDARY_CONTROLS
+		;
+
+	secondary_cpu_based_controls = 0
+		| SECONDARY_EXEC_ENABLE_EPT
+		| SECONDARY_EXEC_UNRESTRICTED_GUEST
 		;
 
 	pin_based_controls = 0
@@ -594,11 +623,18 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 		| PIN_BASED_VMX_PREEMPTION_TIMER
 		;
 
-	vmentry_controls = 0;
+	vmentry_controls = 0
+		| VM_ENTRY_LOAD_IA32_EFER
+		| VM_ENTRY_LOAD_IA32_PAT
+		;
 
 	vmexit_controls = 0
 		| VM_EXIT_HOST_ADDR_SPACE_SIZE
 		| VM_EXIT_SAVE_VMX_PREEMPTION_TIMER
+		| VM_EXIT_SAVE_IA32_EFER
+		| VM_EXIT_LOAD_IA32_EFER
+		| VM_EXIT_SAVE_IA32_PAT
+		| VM_EXIT_LOAD_IA32_PAT
 		;
 
 	rdmsrl_safe(MSR_IA32_VMX_BASIC, &vmx_basic);
@@ -616,8 +652,11 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 	else
 		rdmsrl_safe(MSR_IA32_VMX_PROCBASED_CTLS, &ctrls);
 
-	cpu_based_controls |= ctrls & 0xFFFFFFFF;
-	cpu_based_controls &= (ctrls >> 32);
+	primary_cpu_based_controls |= ctrls & 0xFFFFFFFF;
+	primary_cpu_based_controls &= (ctrls >> 32);
+
+	rdmsrl_safe(MSR_IA32_VMX_PROCBASED_CTLS2, &ctrls);
+	secondary_cpu_based_controls &= (ctrls >> 32);
 
 	if (vmx_basic & VMX_BASIC_USE_TRUE_CTRLS)
 		rdmsrl_safe(MSR_IA32_VMX_TRUE_EXIT_CTLS, &ctrls);
@@ -642,7 +681,8 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 		goto out;
 
 	sand_cpu_vmcs_write_32(PIN_BASED_VM_EXEC_CONTROL, pin_based_controls);
-	sand_cpu_vmcs_write_32(CPU_BASED_VM_EXEC_CONTROL, cpu_based_controls);
+	sand_cpu_vmcs_write_32(CPU_BASED_VM_EXEC_CONTROL, primary_cpu_based_controls);
+	sand_cpu_vmcs_write_32(SECONDARY_VM_EXEC_CONTROL, secondary_cpu_based_controls);
 	sand_cpu_vmcs_write_32(VM_EXIT_CONTROLS, vmexit_controls);
 	sand_cpu_vmcs_write_32(VM_ENTRY_CONTROLS, vmentry_controls);
 
@@ -670,8 +710,10 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 
 	pr_info("Pin based exec control: %x\n",
 		sand_cpu_vmcs_read_32(PIN_BASED_VM_EXEC_CONTROL));
-	pr_info("Cpu based VM exec control: %x\n",
+	pr_info("Primary cpu based VM exec control: %x\n",
 		sand_cpu_vmcs_read_32(CPU_BASED_VM_EXEC_CONTROL));
+	pr_info("Secondary cpu based VM exec control: %x\n",
+		sand_cpu_vmcs_read_32(SECONDARY_VM_EXEC_CONTROL));
 	pr_info("VM exit controls: %x\n",
 		sand_cpu_vmcs_read_32(VM_EXIT_CONTROLS));
 	pr_info("VM entry controls: %x\n",
@@ -702,40 +744,72 @@ static int sand_open(struct inode *inode, struct file *file)
 		goto out_free_ctx;
 	}
 
-	ctx->code = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
+	ctx->code = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!ctx->code) {
 		pr_err("Failed to alloc code page\n");
 		goto out_free_vmcs;
 	}
 
-	ctx->data = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
+	ctx->data = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!ctx->data) {
 		pr_err("Failed to alloc data page\n");
 		goto out_free_code;
 	}
 
-	ctx->stack = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
+	ctx->stack = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!ctx->stack) {
 		pr_err("Failed to alloc stack page\n");
 		goto out_free_data;
 	}
 
-	ctx->page_dir = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
+	ctx->page_dir = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!ctx->page_dir) {
 		pr_err("Failed to alloc page for page directory\n");
 		goto out_free_stack;
 	}
 
-	ctx->page_table = (void *)get_zeroed_page(GFP_DMA32 | GFP_KERNEL);
+	ctx->page_table = (void *)get_zeroed_page(GFP_KERNEL);
 	if (!ctx->page_table) {
 		pr_err("Failed to alloc page for page table\n");
 		goto out_free_page_dir;
+	}
+
+	ctx->ept_pml4 = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!ctx->ept_pml4) {
+		pr_err("Failed to alloc page for EPT PML4 table\n");
+		goto out_free_page_table;
+	}
+
+	ctx->ept_pdpt = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!ctx->ept_pdpt) {
+		pr_err("Failed to alloc page for EPT page-directory-pointer table\n");
+		goto out_free_ept_pml4;
+	}
+
+	ctx->ept_pd = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!ctx->ept_pd) {
+		pr_err("Failed to alloc page for EPT page directory\n");
+		goto out_free_ept_pdpt;
+	}
+
+	ctx->ept_pt = (void *)get_zeroed_page(GFP_KERNEL);
+	if (!ctx->ept_pt) {
+		pr_err("Failed to alloc page for EPT page table\n");
+		goto out_free_ept_pd;
 	}
 
 	file->private_data = ctx;
 
 	return 0;
 
+out_free_ept_pd:
+	free_page((unsigned long)ctx->ept_pd);
+out_free_ept_pdpt:
+	free_page((unsigned long)ctx->ept_pdpt);
+out_free_ept_pml4:
+	free_page((unsigned long)ctx->ept_pml4);
+out_free_page_table:
+	free_page((unsigned long)ctx->page_table);
 out_free_page_dir:
 	free_page((unsigned long)ctx->page_dir);
 out_free_stack:
@@ -769,6 +843,14 @@ static int sand_release(struct inode *inode, struct file *file)
 			free_page((unsigned long)ctx->page_dir);
 		if (ctx->page_table)
 			free_page((unsigned long)ctx->page_table);
+		if (ctx->ept_pml4)
+			free_page((unsigned long)ctx->ept_pml4);
+		if (ctx->ept_pdpt)
+			free_page((unsigned long)ctx->ept_pdpt);
+		if (ctx->ept_pd)
+			free_page((unsigned long)ctx->ept_pd);
+		if (ctx->ept_pt)
+			free_page((unsigned long)ctx->ept_pt);
 
 		kfree(ctx);
 	}
@@ -906,6 +988,8 @@ static long sand_ioctl(struct file *file, unsigned int cmd,
 	sandbox.ebx = ctx->guest_ctx.rbx;
 	sandbox.ecx = ctx->guest_ctx.rcx;
 	sandbox.edx = ctx->guest_ctx.rdx;
+
+	sand_cpu_invept(SINGLE_CONTEXT, sand_cpu_vmcs_read_64(EPT_POINTER));
 
 	if (sand_cpu_vmcs_clear(virt_to_phys(ctx->vmcs))) {
 		pr_err("Failed to clear VMCS\n");
