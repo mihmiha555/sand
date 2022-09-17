@@ -21,11 +21,13 @@
 #define VM_TIMEOUT_MS 5000
 
 enum sand_hypercalls {
-	SAND_HC_GET_PRANDOM_VALUE = 1
+	SAND_HC_GET_PRANDOM_VALUE = 1,
+	SAND_HC_NOTIFY_EXCEPTION = 2
 };
 
 enum sand_hypercall_errors {
-	SAND_UNKNOWN_HYPERCALL = 1000
+	SAND_UNKNOWN_HYPERCALL = 1000,
+	SAND_UNKNOWN_EXCEPTION = 1001
 };
 
 enum invept_type {
@@ -111,6 +113,33 @@ static struct sand_dev dev = {
 		.name = DEVICE_NAME,
 		.fops = &sand_misc_fops
 	}
+};
+
+#define X86_EXCEPTIONS_NUMBER 22
+
+static const char* const x86_exceptions[X86_EXCEPTIONS_NUMBER] = {
+	"Divide error exception (#DE)",
+	"Debug exception (#DB)",
+	"NMI interrupt",
+	"Breakpoint exception (#BP)",
+	"Overflow exception (#OF)",
+	"BOUND range exceeded exception (#BR)",
+	"Invalid opcode exception (#UD)",
+	"Device not available exception (#NM)",
+	"Double fault exception (#DF)",
+	"Coprocessor segment overrun",
+	"Invalid TSS exception (#TS)",
+	"Segment not present exception (#NP)",
+	"Stack fault exception (#SS)",
+	"General protection exception (#GP)",
+	"Page-fault exception (#PF)",
+	"",
+	"x87 FPU floating-point error (#MF)",
+	"Alignment check exception (#AC)",
+	"Machine-check exception (#MC)",
+	"SIMD floating-point exception (#XM)",
+	"Virtualization exception (#VE)",
+	"Control protection exception (#CP)"
 };
 
 extern int _sand_cpu_vmxon(uint64_t *addr);
@@ -879,6 +908,17 @@ static void handle_hypercall(struct sand_ctx *ctx)
 	switch (nr) {
 	case SAND_HC_GET_PRANDOM_VALUE:
 		ret = prandom_u32() & 0xFFFF;
+		break;
+	case SAND_HC_NOTIFY_EXCEPTION:
+		if (arg[0] < X86_EXCEPTIONS_NUMBER && arg[0] != 15) {
+			pr_notice("%s has occurred! Error code = %llx\n",
+						x86_exceptions[arg[0]], arg[1]);
+			ret = 0;
+		} else {
+			pr_warning("Unknown exception has occurred! Vector = %llx\n",
+						arg[0]);
+			ret = -SAND_UNKNOWN_EXCEPTION;
+		}
 		break;
 	default:
 		pr_warning("Unknown hypercall %llu\n", nr);
