@@ -440,23 +440,50 @@ static uint32_t millisecs_to_preempt_timer_value(uint32_t millisecs)
 	return preemption_timer_value;
 }
 
+static void save_host_state(struct sand_ctx *ctx)
+{
+	extern void sand_vm_exit(void);
+
+	sand_cpu_vmcs_write(HOST_CR0, read_cr0() & ~X86_CR0_TS);
+	sand_cpu_vmcs_write(HOST_CR3, __read_cr3());
+	sand_cpu_vmcs_write(HOST_CR4, __read_cr4());
+
+	sand_cpu_vmcs_write(HOST_RSP, (unsigned long)&ctx->saved_host_ctx);
+	sand_cpu_vmcs_write(HOST_RIP, (unsigned long)(void *)sand_vm_exit);
+
+	sand_cpu_vmcs_write_32(HOST_CS_SELECTOR,
+			(uint32_t)sand_cpu_get_cs());
+	sand_cpu_vmcs_write_32(HOST_DS_SELECTOR,
+			(uint32_t)sand_cpu_get_ds());
+	sand_cpu_vmcs_write_32(HOST_ES_SELECTOR,
+			(uint32_t)sand_cpu_get_es());
+	sand_cpu_vmcs_write_32(HOST_SS_SELECTOR,
+			(uint32_t)sand_cpu_get_ss());
+	sand_cpu_vmcs_write_32(HOST_FS_SELECTOR,
+			(uint32_t)sand_cpu_get_fs() & 0xFFFC);
+	sand_cpu_vmcs_write_32(HOST_GS_SELECTOR,
+			(uint32_t)sand_cpu_get_gs() & 0xFFFC);
+	sand_cpu_vmcs_write_32(HOST_TR_SELECTOR,
+			(uint32_t)sand_cpu_get_tr());
+
+	sand_cpu_vmcs_write(HOST_FS_BASE, sand_cpu_get_fs_base());
+	sand_cpu_vmcs_write(HOST_GS_BASE, sand_cpu_get_gs_base());
+	sand_cpu_vmcs_write(HOST_TR_BASE, sand_cpu_get_tr_base());
+	sand_cpu_vmcs_write(HOST_GDTR_BASE, sand_cpu_get_gdtr_base());
+	sand_cpu_vmcs_write(HOST_IDTR_BASE, sand_cpu_get_idtr_base());
+
+	sand_cpu_vmcs_write(HOST_IA32_SYSENTER_CS, sand_cpu_get_sysenter_cs());
+	sand_cpu_vmcs_write(HOST_IA32_SYSENTER_ESP, sand_cpu_get_sysenter_esp());
+	sand_cpu_vmcs_write(HOST_IA32_SYSENTER_EIP, sand_cpu_get_sysenter_eip());
+
+	sand_cpu_vmcs_write_64(HOST_IA32_PERF_GLOBAL_CTRL, 0);
+	sand_cpu_vmcs_write_64(HOST_IA32_PAT, sand_cpu_get_pat());
+	sand_cpu_vmcs_write_64(HOST_IA32_EFER, sand_cpu_get_efer());
+}
+
 static void init_guest_state(void)
 {
 	const uint8_t uc = 0, wt = 4, wb = 6, ucm = 7;
-	const unsigned long guest_cr0_bits = 0
-		| X86_CR0_PG
-		| X86_CR0_WP
-		| X86_CR0_MP
-		| X86_CR0_EM
-		| X86_CR0_TS;
-	const unsigned long guest_cr4_bits = 0
-		| X86_CR4_PVI
-		| X86_CR4_DE
-		| X86_CR4_PCE
-		| X86_CR4_OSFXSR
-		| X86_CR4_OSXMMEXCPT
-		| X86_CR4_PGE
-		| X86_CR4_TSD;
 	union {
 		uint8_t array[8];
 		uint64_t word;
@@ -467,68 +494,16 @@ static void init_guest_state(void)
 	};
 	const uint32_t timer_value = millisecs_to_preempt_timer_value(VM_TIMEOUT_MS);
 
-	sand_cpu_vmcs_write_32(VMX_PREEMPTION_TIMER_VALUE, timer_value);
-	sand_cpu_vmcs_write_32(VIRTUAL_PROCESSOR_ID, 0);
-	sand_cpu_vmcs_write_64(VMCS_LINK_POINTER, -1ull);
+	sand_cpu_vmcs_write(GUEST_CR0, X86_CR0_PE | X86_CR0_NE | X86_CR0_MP);
+	sand_cpu_vmcs_write(GUEST_CR3, 0);
+	sand_cpu_vmcs_write(GUEST_CR4, X86_CR4_PSE | X86_CR4_VMXE | X86_CR4_OSFXSR
+									| X86_CR4_OSXMMEXCPT);
 
 	sand_cpu_vmcs_write(GUEST_DR7, 0x400);
-	sand_cpu_vmcs_write_64(GUEST_IA32_PAT, pat.word);
-	sand_cpu_vmcs_write_32(GUEST_ACTIVITY_STATE, 0);
-
-	sand_cpu_vmcs_write(CR0_GUEST_HOST_MASK, ~guest_cr0_bits);
-	sand_cpu_vmcs_write(CR4_GUEST_HOST_MASK, ~guest_cr4_bits);
-}
-
-static void set_initial_guest_ctx(struct sand_ctx *ctx)
-{
-	/* Setting up EPTP: write-back caching, page-walk length 4. */
-	const uint64_t eptp = virt_to_phys(ctx->ept_pml4) | (3 << 3) | 6;
-
-	/* Read/write/execute access for this 512Gb region. */
-	((uint64_t *)ctx->ept_pml4)[0] = virt_to_phys(ctx->ept_pdpt) | 7;
-	/* Read/write/execute access for this 1Gb region. */
-	((uint64_t *)ctx->ept_pdpt)[0] = virt_to_phys(ctx->ept_pd) | 7;
-	/* Read/write/execute access for this 2Mb region. */
-	((uint64_t *)ctx->ept_pd)[0] = virt_to_phys(ctx->ept_pt) | 7;
-
-	/* Read/write access, write-back caching. */
-	((uint64_t *)ctx->ept_pt)[0] = virt_to_phys(ctx->stack) | (6 << 3) | 3;
-	/* Read/execute access, write-back caching. */
-	((uint64_t *)ctx->ept_pt)[1] = virt_to_phys(ctx->code)  | (6 << 3) | 5;
-	/* Read/write access, write-back caching. */
-	((uint64_t *)ctx->ept_pt)[2] = virt_to_phys(ctx->data)  | (6 << 3) | 3;
-	/* Read/write access, write-back caching. */
-	((uint64_t *)ctx->ept_pt)[3] = virt_to_phys(ctx->page_table) | (6 << 3) | 3;
-	/* Read/write access, write-back caching. */
-	((uint64_t *)ctx->ept_pt)[4] = virt_to_phys(ctx->page_dir)   | (6 << 3) | 3;
-
-	sand_cpu_vmcs_write_64(EPT_POINTER, eptp);
 
 	sand_cpu_vmcs_write(GUEST_RSP, 4096);
 	sand_cpu_vmcs_write(GUEST_RIP, 4096);
 	sand_cpu_vmcs_write(GUEST_RFLAGS, 0x2);
-
-	sand_cpu_vmcs_write(GUEST_CR0, X86_CR0_PE | X86_CR0_NE | X86_CR0_MP);
-	sand_cpu_vmcs_write(CR0_READ_SHADOW, X86_CR0_PE | X86_CR0_NE);
-	sand_cpu_vmcs_write(GUEST_CR4, X86_CR4_PSE | X86_CR4_VMXE | X86_CR4_OSFXSR
-									| X86_CR4_OSXMMEXCPT);
-	sand_cpu_vmcs_write(CR4_READ_SHADOW, X86_CR4_PSE);
-	sand_cpu_vmcs_write(GUEST_CR3, 0);
-
-	sand_cpu_vmcs_write_64(GUEST_IA32_EFER, 0);
-	sand_cpu_vmcs_write(GUEST_SYSENTER_CS, 0);
-	sand_cpu_vmcs_write(GUEST_SYSENTER_ESP, 0);
-	sand_cpu_vmcs_write(GUEST_SYSENTER_EIP, 0);
-
-	sand_cpu_vmcs_write_32(GUEST_TR_SELECTOR, 0);
-	sand_cpu_vmcs_write(GUEST_TR_BASE, 0);
-	sand_cpu_vmcs_write_32(GUEST_TR_LIMIT, 0xFFFF);
-	sand_cpu_vmcs_write_32(GUEST_TR_AR_BYTES, (1 << 7) | 0xB); /* Present, TSS. */
-
-	sand_cpu_vmcs_write_32(GUEST_LDTR_SELECTOR, 0);
-	sand_cpu_vmcs_write(GUEST_LDTR_BASE, 0);
-	sand_cpu_vmcs_write_32(GUEST_LDTR_LIMIT, 0);
-	sand_cpu_vmcs_write_32(GUEST_LDTR_AR_BYTES, 1 << 16);      /* Unusable. */
 
 	sand_cpu_vmcs_write_32(GUEST_CS_SELECTOR, 0);
 	sand_cpu_vmcs_write(GUEST_CS_BASE, 0);
@@ -595,36 +570,30 @@ static void set_initial_guest_ctx(struct sand_ctx *ctx)
 			| (1 << 4)   /* Not system. */
 			| 0x2        /* Data R/W. */
 			| 0x1);      /* Accessed. */
+
+	sand_cpu_vmcs_write_32(GUEST_LDTR_SELECTOR, 0);
+	sand_cpu_vmcs_write(GUEST_LDTR_BASE, 0);
+	sand_cpu_vmcs_write_32(GUEST_LDTR_LIMIT, 0);
+	sand_cpu_vmcs_write_32(GUEST_LDTR_AR_BYTES, 1 << 16);      /* Unusable. */
+
+	sand_cpu_vmcs_write_32(GUEST_TR_SELECTOR, 0);
+	sand_cpu_vmcs_write(GUEST_TR_BASE, 0);
+	sand_cpu_vmcs_write_32(GUEST_TR_LIMIT, 0xFFFF);
+	sand_cpu_vmcs_write_32(GUEST_TR_AR_BYTES, (1 << 7) | 0xB); /* Present, TSS. */
+
+	sand_cpu_vmcs_write(GUEST_SYSENTER_CS, 0);
+	sand_cpu_vmcs_write(GUEST_SYSENTER_ESP, 0);
+	sand_cpu_vmcs_write(GUEST_SYSENTER_EIP, 0);
+
+	sand_cpu_vmcs_write_64(GUEST_IA32_PAT, pat.word);
+	sand_cpu_vmcs_write_64(GUEST_IA32_EFER, 0);
+
+	sand_cpu_vmcs_write_32(GUEST_ACTIVITY_STATE, 0);
+	sand_cpu_vmcs_write_64(VMCS_LINK_POINTER, -1ull);
+	sand_cpu_vmcs_write_32(VMX_PREEMPTION_TIMER_VALUE, timer_value);
 }
 
-static void save_host_state(void)
-{
-	sand_cpu_vmcs_write_32(HOST_CS_SELECTOR,
-			(uint32_t)sand_cpu_get_cs());
-	sand_cpu_vmcs_write_32(HOST_DS_SELECTOR,
-			(uint32_t)sand_cpu_get_ds());
-	sand_cpu_vmcs_write_32(HOST_ES_SELECTOR,
-			(uint32_t)sand_cpu_get_es());
-	sand_cpu_vmcs_write_32(HOST_SS_SELECTOR,
-			(uint32_t)sand_cpu_get_ss());
-	sand_cpu_vmcs_write_32(HOST_FS_SELECTOR,
-			(uint32_t)sand_cpu_get_fs() & 0xFFFC);
-	sand_cpu_vmcs_write_32(HOST_GS_SELECTOR,
-			(uint32_t)sand_cpu_get_gs() & 0xFFFC);
-	sand_cpu_vmcs_write_32(HOST_TR_SELECTOR,
-			(uint32_t)sand_cpu_get_tr());
-
-	sand_cpu_vmcs_write(HOST_FS_BASE, sand_cpu_get_fs_base());
-	sand_cpu_vmcs_write(HOST_GS_BASE, sand_cpu_get_gs_base());
-	sand_cpu_vmcs_write(HOST_TR_BASE, sand_cpu_get_tr_base());
-	sand_cpu_vmcs_write(HOST_GDTR_BASE, sand_cpu_get_gdtr_base());
-	sand_cpu_vmcs_write(HOST_IDTR_BASE, sand_cpu_get_idtr_base());
-	sand_cpu_vmcs_write(HOST_IA32_SYSENTER_CS, sand_cpu_get_sysenter_cs());
-	sand_cpu_vmcs_write(HOST_IA32_SYSENTER_ESP, sand_cpu_get_sysenter_esp());
-	sand_cpu_vmcs_write(HOST_IA32_SYSENTER_EIP, sand_cpu_get_sysenter_eip());
-}
-
-static int init_sand_ctx(struct sand_ctx *ctx)
+static void init_vmx_control_fields(void)
 {
 	uint32_t primary_cpu_based_controls;
 	uint32_t secondary_cpu_based_controls;
@@ -633,8 +602,6 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 	uint32_t vmexit_controls;
 
 	uint64_t vmx_basic = 0, ctrls = 0;
-
-	extern void sand_vm_exit(void);
 
 	primary_cpu_based_controls = 0
 		| CPU_BASED_HLT_EXITING
@@ -703,39 +670,11 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 	vmentry_controls |= ctrls & 0xFFFFFFFF;
 	vmentry_controls &= (ctrls >> 32);
 
-	sand_cpu_vmcs_clear(virt_to_phys(ctx->vmcs));
-	*((uint32_t*)ctx->vmcs) = (uint32_t)vmx_basic;
-
-	if (sand_cpu_vmcs_load(virt_to_phys(ctx->vmcs)))
-		goto out;
-
 	sand_cpu_vmcs_write_32(PIN_BASED_VM_EXEC_CONTROL, pin_based_controls);
 	sand_cpu_vmcs_write_32(CPU_BASED_VM_EXEC_CONTROL, primary_cpu_based_controls);
 	sand_cpu_vmcs_write_32(SECONDARY_VM_EXEC_CONTROL, secondary_cpu_based_controls);
 	sand_cpu_vmcs_write_32(VM_EXIT_CONTROLS, vmexit_controls);
 	sand_cpu_vmcs_write_32(VM_ENTRY_CONTROLS, vmentry_controls);
-
-	sand_cpu_vmcs_write_32(PAGE_FAULT_ERROR_CODE_MASK, 0);
-	sand_cpu_vmcs_write_32(PAGE_FAULT_ERROR_CODE_MATCH, 0);
-	sand_cpu_vmcs_write_32(EXCEPTION_BITMAP, 0);
-
-	save_host_state();
-
-	sand_cpu_vmcs_write_64(HOST_IA32_PAT, sand_cpu_get_pat());
-	sand_cpu_vmcs_write_64(HOST_IA32_EFER, sand_cpu_get_efer());
-	sand_cpu_vmcs_write_64(HOST_IA32_PERF_GLOBAL_CTRL, 0);
-
-	sand_cpu_vmcs_write(HOST_CR0, read_cr0() & ~X86_CR0_TS);
-	sand_cpu_vmcs_write(HOST_CR3, __read_cr3());
-	sand_cpu_vmcs_write(HOST_CR4, __read_cr4());
-
-	sand_cpu_vmcs_write_32(CR3_TARGET_COUNT, 0);
-
-	sand_cpu_vmcs_write(HOST_RIP, (unsigned long)(void *)sand_vm_exit);
-	sand_cpu_vmcs_write(HOST_RSP, (unsigned long)&ctx->saved_host_ctx);
-
-	init_guest_state();
-	set_initial_guest_ctx(ctx);
 
 	pr_info("Pin based exec control: %x\n",
 		sand_cpu_vmcs_read_32(PIN_BASED_VM_EXEC_CONTROL));
@@ -747,6 +686,86 @@ static int init_sand_ctx(struct sand_ctx *ctx)
 		sand_cpu_vmcs_read_32(VM_EXIT_CONTROLS));
 	pr_info("VM entry controls: %x\n",
 		sand_cpu_vmcs_read_32(VM_ENTRY_CONTROLS));
+}
+
+static void init_other_vm_exec_controls(void)
+{
+	const unsigned long guest_cr0_bits = 0
+		| X86_CR0_PG
+		| X86_CR0_WP
+		| X86_CR0_MP
+		| X86_CR0_EM
+		| X86_CR0_TS;
+	const unsigned long guest_cr4_bits = 0
+		| X86_CR4_PVI
+		| X86_CR4_DE
+		| X86_CR4_PCE
+		| X86_CR4_OSFXSR
+		| X86_CR4_OSXMMEXCPT
+		| X86_CR4_PGE
+		| X86_CR4_TSD;
+
+	sand_cpu_vmcs_write_32(EXCEPTION_BITMAP, 0);
+	sand_cpu_vmcs_write_32(PAGE_FAULT_ERROR_CODE_MASK, 0);
+	sand_cpu_vmcs_write_32(PAGE_FAULT_ERROR_CODE_MATCH, 0);
+
+	sand_cpu_vmcs_write(CR0_GUEST_HOST_MASK, ~guest_cr0_bits);
+	sand_cpu_vmcs_write(CR0_READ_SHADOW, X86_CR0_PE | X86_CR0_NE);
+
+	sand_cpu_vmcs_write(CR4_GUEST_HOST_MASK, ~guest_cr4_bits);
+	sand_cpu_vmcs_write(CR4_READ_SHADOW, X86_CR4_PSE);
+
+	sand_cpu_vmcs_write_32(CR3_TARGET_COUNT, 0);
+	sand_cpu_vmcs_write_32(VIRTUAL_PROCESSOR_ID, 0);
+}
+
+static void init_ept(struct sand_ctx *ctx)
+{
+	/* Setting up EPTP: write-back caching, page-walk length 4. */
+	const uint64_t eptp = virt_to_phys(ctx->ept_pml4) | (3 << 3) | 6;
+
+	/* Read/write/execute access for this 512Gb region. */
+	((uint64_t *)ctx->ept_pml4)[0] = virt_to_phys(ctx->ept_pdpt) | 7;
+	/* Read/write/execute access for this 1Gb region. */
+	((uint64_t *)ctx->ept_pdpt)[0] = virt_to_phys(ctx->ept_pd) | 7;
+	/* Read/write/execute access for this 2Mb region. */
+	((uint64_t *)ctx->ept_pd)[0] = virt_to_phys(ctx->ept_pt) | 7;
+
+	/* Read/write access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[0] = virt_to_phys(ctx->stack) | (6 << 3) | 3;
+	/* Read/execute access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[1] = virt_to_phys(ctx->code)  | (6 << 3) | 5;
+	/* Read/write access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[2] = virt_to_phys(ctx->data)  | (6 << 3) | 3;
+	/* Read/write access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[3] = virt_to_phys(ctx->page_table) | (6 << 3) | 3;
+	/* Read/write access, write-back caching. */
+	((uint64_t *)ctx->ept_pt)[4] = virt_to_phys(ctx->page_dir)   | (6 << 3) | 3;
+
+	sand_cpu_vmcs_write_64(EPT_POINTER, eptp);
+}
+
+static int init_sand_ctx(struct sand_ctx *ctx)
+{
+	uint64_t vmx_basic = 0;
+
+	rdmsrl_safe(MSR_IA32_VMX_BASIC, &vmx_basic);
+
+	sand_cpu_vmcs_clear(virt_to_phys(ctx->vmcs));
+	*((uint32_t*)ctx->vmcs) = (uint32_t)vmx_basic;
+
+	if (sand_cpu_vmcs_load(virt_to_phys(ctx->vmcs)))
+		goto out;
+
+	save_host_state(ctx);
+
+	init_guest_state();
+
+	init_vmx_control_fields();
+
+	init_other_vm_exec_controls();
+
+	init_ept(ctx);
 
 	if (sand_cpu_vmcs_clear(virt_to_phys(ctx->vmcs)))
 		goto out;
